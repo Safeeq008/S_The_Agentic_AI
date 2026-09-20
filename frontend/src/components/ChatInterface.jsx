@@ -40,17 +40,38 @@ export default function ChatInterface({
             <div className="messages-list">
                 {messages.map((msg) => (
                     <div key={msg.id} className={`message message-${msg.role}`}>
-                        <div className="message-content">{msg.content}</div>
+                        <div className="message-content">
+                            {msg.content}
+                            {isStreaming && msg.role === "assistant" && msg.id === messages[messages.length - 1]?.id && (
+                                <span className="streaming-indicator">
+                                    <span className="streaming-dot"></span>
+                                    <span className="streaming-dot"></span>
+                                    <span className="streaming-dot"></span>
+                                </span>
+                            )}
+                        </div>
 
                         {/* Tool call visualization */}
                         {msg.toolCalls?.map((tc, i) => (
                             <div key={i} className={`tool-call tool-${tc.status}`}>
-                                <span className="tool-icon">🔍</span>
+                                <span className="tool-icon">
+                                    {tc.name === "web_search" ? "🔍" :
+                                     tc.name === "get_current_time" ? "🕐" :
+                                     tc.name === "execute_calculation" ? "🧮" : "🔧"}
+                                </span>
                                 <span className="tool-name">
-                                    {tc.name === "web_search" ? "Web Search" : tc.name}
+                                    {tc.name === "web_search" ? "Web Search" :
+                                     tc.name === "get_current_time" ? "Get Time" :
+                                     tc.name === "execute_calculation" ? "Calculation" : tc.name}
                                 </span>
                                 {tc.arguments?.query && (
                                     <code className="tool-query">"{tc.arguments.query}"</code>
+                                )}
+                                {tc.arguments?.expression && (
+                                    <code className="tool-query">{tc.arguments.expression}</code>
+                                )}
+                                {tc.status === "running" && (
+                                    <span className="tool-spinner">⏳</span>
                                 )}
                                 {tc.status === "complete" && tc.result?.results && (
                                     <div className="tool-results">
@@ -65,6 +86,20 @@ export default function ChatInterface({
                                                 {r.title}
                                             </a>
                                         ))}
+                                    </div>
+                                )}
+                                {tc.status === "complete" && tc.result?.datetime && (
+                                    <div className="tool-results">
+                                        <span className="result-text">
+                                            {tc.result.day_of_week}, {tc.result.date} at {tc.result.time}
+                                        </span>
+                                    </div>
+                                )}
+                                {tc.status === "complete" && tc.result?.result !== undefined && (
+                                    <div className="tool-results">
+                                        <span className="result-text">
+                                            = {tc.result.result}
+                                        </span>
                                     </div>
                                 )}
                             </div>

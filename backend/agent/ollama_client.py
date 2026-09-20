@@ -1,14 +1,18 @@
 import os
 import json
+import re
 import logging
 from typing import AsyncGenerator
 import ollama
 from ollama import AsyncClient
 
 from agent.exa_tools import (
+    ALL_TOOLS,
     EXA_SEARCH_TOOL,
     execute_exa_search,
     format_search_results_for_model,
+    execute_get_current_time,
+    execute_calculation,
 )
 from models.schemas import SSEEventType
 
@@ -19,17 +23,43 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
 client = AsyncClient(host=OLLAMA_HOST)
 
-# ── System prompt tuned for Qwen2.5's tool-use behavior ──
-# Qwen2.5 uses the Hermes-style tool-call format internally. When
-# running through Ollama, the model emits OpenAI-compatible tool_calls
-# in the response object rather than inline text. [reference:3]
-SYSTEM_PROMPT = """You are a helpful AI assistant with access to a web search tool.
+SYSTEM_PROMPT = """You are a helpful AI assistant with access to tools.
 
-When the user asks about current events, real-time data, specific websites, or any topic requiring up-to-date information, use the `web_search` function. Provide clear, concise answers with citations from search results.
+RULES:
+1. For ANY question about news, sports (NFL, NBA, etc.), weather, stocks, current events, recent events, today/tomorrow/yesterday, or anything requiring current information - you MUST use the web_search tool FIRST.
+2. For questions about specific people, companies, products, or events - use web_search to get current information.
+3. For questions about date/time - use get_current_time.
+4. For math questions - use execute_calculation.
+5. When in doubt - ALWAYS use web_search. It is better to search unnecessarily than to give outdated information.
+6. NEVER say "I cannot provide real-time data" or "I don't have access to current information". You HAVE the tools. USE THEM.
+7. After receiving search results, cite sources using format: [Title](URL)
 
-If the user's question can be answered with your existing knowledge, respond directly without searching. Always cite sources using the format [Title](URL) when you use search results.
+Topics requiring web_search:
+- Sports (NFL, NBA, MLB, soccer) - scores, news, schedules
+- News (world, politics, business, technology)
+- Weather, forecasts
+- Stock/crypto prices
+- Any question with "today", "latest", "recent", "current", "now"
+- Years (2024, 2025, 2026)"""
 
-Be concise but thorough. Never fabricate information — if search results are insufficient, say so."""
+
+REALTIME_KEYWORDS = [
+    r"\bnews\b", r"\bsports\b", r"\bnfl\b", r"\bnba\b", r"\bmlb\b",
+    r"\bweather\b", r"\bstock\b", r"\bcrypto\b", r"\bprice\b",
+    r"\btoday\b", r"\btonight\b", r"\btomorrow\b", r"\byesterday\b",
+    r"\blast\b", r"\blatest\b", r"\bcurrent\b", r"\brecent\b",
+    r"\bright now\b", r"\bnow\b", r"\bthis week\b", r"\bthis month\b",
+    r"\bscore\b", r"\bscores\b", r"\bgame\b", r"\bmatch\b",
+    r"\belection\b", r"\bmarket\b", r"\beconomy\b",
+    r"\b2024\b", r"\b2025\b", r"\b2026\b",
+    r"\bwho won\b", r"\bwho is\b", r"\bwhat happened\b",
+    r"\bupdate\b", r"\bbreaking\b", r"\bannouncement\b",
+]
+
+def needs_web_search(query: str) -> bool:
+    """Detect if a query likely requires real-time web search."""
+    q = query.lower()
+    return any(re.search(pattern, q) for pattern in REALTIME_KEYWORDS)
 
 
 async def run_agent_stream(
@@ -39,13 +69,6 @@ async def run_agent_stream(
     """
     Async generator that runs the full agent loop with streaming.
     Yields SSE event dicts: {type, data}.
-
-    The loop:
-    1. Send messages + tools to Ollama with stream=True
-    2. Accumulate streaming chunks; watch for tool_calls
-    3. If a tool_call is emitted, execute EXA search
-    4. Append tool result to messages and loop again
-    5. Yield final content tokens and a done event
     """
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -55,6 +78,7 @@ async def run_agent_stream(
 
     max_iterations = 5
     iteration = 0
+    used_tool = False
 
     while iteration < max_iterations:
         iteration += 1
@@ -62,43 +86,40 @@ async def run_agent_stream(
         content_accumulated = ""
 
         try:
-            # ── Stream from Ollama ──
             stream = await client.chat(
                 model=OLLAMA_MODEL,
                 messages=messages,
-                tools=[EXA_SEARCH_TOOL],
+                tools=ALL_TOOLS,
                 stream=True,
             )
 
             async for chunk in stream:
                 msg = chunk.message
 
-                # Thinking trace (if model supports it)
                 if getattr(msg, "thinking", None):
                     yield {
                         "type": SSEEventType.thinking,
                         "data": msg.thinking,
                     }
 
-                # Accumulate content tokens
+                # BUFFER content — don't yield yet, tool call may follow
                 if msg.content:
                     content_accumulated += msg.content
-                    yield {
-                        "type": SSEEventType.token,
-                        "data": msg.content,
-                    }
 
-                # Accumulate tool calls — Ollama streams tool_calls across chunks [reference:4]
                 if getattr(msg, "tool_calls", None):
                     for tc in msg.tool_calls:
                         tool_calls_accumulated.append(tc)
 
             # ── After streaming completes, check for tool calls ──
             if tool_calls_accumulated:
-                # Append assistant message with the tool call
+                used_tool = True
+
+                # Discard the "I'm sorry" text the model generated before tool call
+                content_accumulated = ""
+
                 assistant_msg = {
                     "role": "assistant",
-                    "content": content_accumulated or None,
+                    "content": None,
                     "tool_calls": [
                         {
                             "function": {
@@ -115,7 +136,6 @@ async def run_agent_stream(
                     fn_name = tc.function.name
                     fn_args = tc.function.arguments
 
-                    # Arguments arrive as a JSON string — parse it [reference:5]
                     if isinstance(fn_args, str):
                         fn_args = json.loads(fn_args)
 
@@ -140,7 +160,6 @@ async def run_agent_stream(
                                 },
                             }
 
-                            # Append tool result to messages and continue loop
                             messages.append({
                                 "role": "tool",
                                 "content": formatted,
@@ -152,10 +171,98 @@ async def run_agent_stream(
                                 "content": f"Search failed: {str(e)}. Please answer based on your knowledge.",
                             })
 
-                # Loop again — model will process the tool results
+                    elif fn_name == "get_current_time":
+                        time_result = execute_get_current_time()
+                        yield {
+                            "type": SSEEventType.tool_call_result,
+                            "data": {
+                                "name": fn_name,
+                                "result": time_result,
+                            },
+                        }
+                        messages.append({
+                            "role": "tool",
+                            "content": json.dumps(time_result),
+                        })
+
+                    elif fn_name == "execute_calculation":
+                        calc_result = execute_calculation(**fn_args)
+                        yield {
+                            "type": SSEEventType.tool_call_result,
+                            "data": {
+                                "name": fn_name,
+                                "result": calc_result,
+                            },
+                        }
+                        messages.append({
+                            "role": "tool",
+                            "content": json.dumps(calc_result),
+                        })
+
                 continue
 
-            # ── No tool calls — this is the final response ──
+            # ── FALLBACK: Model didn't call tool, but query needs real-time data ──
+            if not used_tool and needs_web_search(user_message):
+                logger.info(f"Fallback: forcing web search for query: {user_message}")
+
+                # Discard the "I can't..." text
+                content_accumulated = ""
+
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "function": {
+                            "name": "web_search",
+                            "arguments": {"query": user_message, "num_results": 5},
+                        }
+                    }],
+                })
+
+                yield {
+                    "type": SSEEventType.tool_call_start,
+                    "data": {
+                        "name": "web_search",
+                        "arguments": {"query": user_message, "num_results": 5},
+                    },
+                }
+
+                try:
+                    search_results = execute_exa_search(
+                        query=user_message, num_results=5
+                    )
+                    formatted = format_search_results_for_model(search_results)
+
+                    yield {
+                        "type": SSEEventType.tool_call_result,
+                        "data": {
+                            "name": "web_search",
+                            "result": search_results,
+                        },
+                    }
+
+                    messages.append({
+                        "role": "tool",
+                        "content": formatted,
+                    })
+
+                    used_tool = True
+                    continue
+
+                except Exception as e:
+                    logger.error(f"Fallback search failed: {e}")
+                    messages.append({
+                        "role": "tool",
+                        "content": f"Search failed: {str(e)}",
+                    })
+
+            # ── No tool calls, no fallback needed — final response ──
+            # Yield any buffered content tokens now
+            if content_accumulated:
+                yield {
+                    "type": SSEEventType.token,
+                    "data": content_accumulated,
+                }
             yield {
                 "type": SSEEventType.done,
                 "data": {"content": content_accumulated},
@@ -170,7 +277,6 @@ async def run_agent_stream(
             }
             return
 
-    # Max iterations exceeded
     yield {
         "type": SSEEventType.error,
         "data": {"message": "Maximum tool iterations reached."},

@@ -22,7 +22,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:1.5b-instruct")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "hf.co/Salesforce/xLAM-2-1b-fc-r-gguf:Q4_K_M")
 CORS_ORIGINS = os.environ.get(
     "CORS_ORIGINS", "http://localhost:5173"
 ).split(",")

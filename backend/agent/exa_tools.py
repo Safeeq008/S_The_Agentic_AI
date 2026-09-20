@@ -1,5 +1,7 @@
 import os
+import json
 import logging
+from datetime import datetime
 from typing import Optional
 from exa_py import Exa
 from tenacity import (
@@ -15,10 +17,6 @@ api_key = os.environ.get("EXA_API_KEY", "e4f681d3-e238-4934-97ad-94f095cebe56")
 exa_client = Exa(api_key=api_key)
 
 
-# ── Tool schema passed to Qwen2.5 via Ollama ──
-# Qwen2.5 uses the OpenAI-compatible tool format natively when
-# running through Ollama. The model will emit tool_calls in the
-# standard OpenAI structure; no schema transformation is needed. [reference:0]
 EXA_SEARCH_TOOL = {
     "type": "function",
     "function": {
@@ -26,7 +24,8 @@ EXA_SEARCH_TOOL = {
         "description": (
             "Search the web for current information. Use this when the user "
             "asks about recent events, real-time data, specific websites, or "
-            "anything requiring up-to-date knowledge beyond your training data."
+            "anything requiring up-to-date knowledge beyond your training data. "
+            "ALWAYS use this for news, sports, weather, stocks, or any current topic."
         ),
         "parameters": {
             "type": "object",
@@ -66,6 +65,70 @@ EXA_SEARCH_TOOL = {
     },
 }
 
+GET_CURRENT_TIME_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_current_time",
+        "description": "Get the current date and time. Use this when the user asks about today's date, current time, or needs to know the current datetime.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+}
+
+EXECUTE_CODE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "execute_calculation",
+        "description": "Execute a mathematical calculation or simple Python expression. Use this when the user asks to calculate something.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "expression": {
+                    "type": "string",
+                    "description": "The mathematical expression to evaluate (e.g., '2 + 2', 'sqrt(144)', '100 * 3.14')",
+                }
+            },
+            "required": ["expression"],
+        },
+    },
+}
+
+ALL_TOOLS = [EXA_SEARCH_TOOL, GET_CURRENT_TIME_TOOL, EXECUTE_CODE_TOOL]
+
+
+def execute_get_current_time() -> dict:
+    """Return the current date and time."""
+    now = datetime.now()
+    return {
+        "datetime": now.isoformat(),
+        "date": now.strftime("%Y-%m-%d"),
+        "time": now.strftime("%H:%M:%S"),
+        "day_of_week": now.strftime("%A"),
+        "timezone": "local",
+    }
+
+
+def execute_calculation(expression: str) -> dict:
+    """Safely evaluate a mathematical expression."""
+    import math
+
+    allowed_names = {
+        "abs": abs, "round": round,
+        "sqrt": math.sqrt, "sin": math.sin, "cos": math.cos,
+        "tan": math.tan, "pi": math.pi, "e": math.e,
+        "log": math.log, "log10": math.log10, "pow": pow,
+        "min": min, "max": max, "sum": sum,
+    }
+
+    try:
+        result = eval(expression, {"__builtins__": {}}, allowed_names)
+        return {"expression": expression, "result": result}
+    except Exception as e:
+        return {"expression": expression, "error": str(e)}
+
 
 @retry(
     stop=stop_after_attempt(3),
@@ -83,8 +146,7 @@ def execute_exa_search(
 ) -> dict:
     """
     Execute a web search via the EXA API with automatic retry on
-    rate limits (429) and transient server errors. The EXA SDK
-    handles auth via the API key set at construction time.
+    rate limits and transient server errors.
     """
     try:
         results = exa_client.search_and_contents(
@@ -95,7 +157,6 @@ def execute_exa_search(
             exclude_domains=exclude_domains,
             start_published_date=start_published_date,
             end_published_date=end_published_date,
-            contents={"highlights": True},  # token-efficient content extraction
         )
 
         formatted = []
@@ -105,6 +166,7 @@ def execute_exa_search(
                 "url": r.url,
                 "highlights": getattr(r, "highlights", []) or [],
                 "published_date": getattr(r, "published_date", None),
+                "text": getattr(r, "text", "")[:500] if getattr(r, "text", None) else "",
             })
 
         logger.info(f"EXA search '{query}' returned {len(formatted)} results")
@@ -112,7 +174,6 @@ def execute_exa_search(
 
     except Exception as e:
         error_str = str(e)
-        # EXA returns 429 for rate limits; the retry decorator handles backoff [reference:1]
         if "429" in error_str or "RATE_LIMIT" in error_str.upper():
             logger.warning(f"EXA rate limit hit for query '{query}': {e}")
             raise
@@ -131,7 +192,9 @@ def format_search_results_for_model(results: dict) -> str:
         if r.get("published_date"):
             lines.append(f"   Published: {r['published_date']}")
         if r.get("highlights"):
-            for h in r["highlights"][:2]:  # limit highlights to reduce tokens
+            for h in r["highlights"][:2]:
                 lines.append(f"   - {h}")
+        if r.get("text"):
+            lines.append(f"   Preview: {r['text'][:200]}...")
         lines.append("")
     return "\n".join(lines)
