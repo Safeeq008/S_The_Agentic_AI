@@ -1,0 +1,18 @@
+# Environment secrets
+.env
+backend/.env
+frontend/.env
+
+# Python
+__pycache__/
+*.pyc
+backend/venv/
+*.egg-info/
+
+# Node
+node_modules/
+frontend/dist/
+
+# IDE
+.antigravity/
+.vscode/
